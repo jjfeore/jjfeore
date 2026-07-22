@@ -1,0 +1,308 @@
+name: Repaint contribution graph
+
+on:
+  schedule:
+    # One small batch per day. GitHub may delay scheduled runs under load.
+    - cron: "13 8 * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Advance one repaint batch, or start legacy cleanup"
+        required: true
+        default: repaint
+        type: choice
+        options:
+          - repaint
+          - cleanup
+
+concurrency:
+  group: contribution-graph-repaint
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  repaint:
+    if: github.repository == 'jjfeore/jjfeore'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      REQUESTED_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'repaint' }}
+      COMMITS_PER_PIXEL: "20"
+      MAX_COMPONENT_COMMITS: "350"
+      MAX_CHANGED_COMMITS: "750"
+      MAX_PAINTED_HISTORY_COMMITS: "1500"
+      LEGACY_CLEANUP_CHUNK_SIZE: "750"
+      MIN_BATCH_AGE_SECONDS: "82800" # 23 hours
+      MIN_ROOT_AGE_SECONDS: "86400"  # 24 hours
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Fetch component branches
+        run: git fetch --prune origin '+refs/heads/*:refs/remotes/origin/*'
+
+      - name: Test painter
+        run: python3 -m unittest discover -s art -p 'test_*.py' -v
+
+      - name: Choose operation
+        id: operation
+        shell: bash
+        run: |
+          set -euo pipefail
+          SUBJECT="$(git show -s --format=%s HEAD)"
+          if [[ "$REQUESTED_MODE" == "cleanup" ]] || \
+             [[ "$SUBJECT" == "chore: staged paint cleanup"* ]]; then
+            echo "mode=cleanup" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=repaint" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Remove one legacy-history batch
+        if: steps.operation.outputs.mode == 'cleanup'
+        shell: bash
+        run: |
+          set -euo pipefail
+          SUBJECT="$(git show -s --format=%s HEAD)"
+          NOW="$(date -u +%s)"
+          HEAD_AGE="$(( NOW - $(git show -s --format=%ct HEAD) ))"
+          if [[ "$SUBJECT" == "chore: staged paint cleanup"* ]] && \
+             (( HEAD_AGE < MIN_BATCH_AGE_SECONDS )); then
+            echo "The previous cleanup batch is only ${HEAD_AGE}s old; the next daily run will continue."
+            exit 0
+          fi
+
+          MERGES="$(git rev-list --merges --count HEAD)"
+          if (( MERGES != 0 )); then
+            echo "::error::Legacy cleanup expects linear history; found ${MERGES} merge commits."
+            exit 1
+          fi
+
+          export GIT_AUTHOR_NAME='github-actions[bot]'
+          export GIT_AUTHOR_EMAIL='41898282+github-actions[bot]@users.noreply.github.com'
+          export GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME"
+          export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
+          STAMP="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          export GIT_AUTHOR_DATE="$STAMP"
+          export GIT_COMMITTER_DATE="$STAMP"
+
+          TREE="$(git rev-parse 'HEAD^{tree}')"
+          TOTAL="$(git rev-list --first-parent --count HEAD)"
+          if (( TOTAL > LEGACY_CLEANUP_CHUNK_SIZE )); then
+            ANCHOR="$(git rev-parse "HEAD~${LEGACY_CLEANUP_CHUNK_SIZE}")"
+            REMAINING="$(git rev-list --first-parent --count "$ANCHOR")"
+            MESSAGE="chore: staged paint cleanup (${REMAINING} legacy commits remain)"
+            NEXT_SHA="$(printf '%s\n' "$MESSAGE" | git commit-tree "$TREE" -p "$ANCHOR")"
+            RESULT="Removed ${LEGACY_CLEANUP_CHUNK_SIZE} legacy commits; ${REMAINING} remain."
+          else
+            MESSAGE='chore: reset contribution graph painter'
+            NEXT_SHA="$(printf '%s\n' "$MESSAGE" | git commit-tree "$TREE")"
+            RESULT="Removed the final ${TOTAL} legacy commits and created the fixed cleanup root."
+          fi
+
+          git push \
+            --force-with-lease="refs/heads/main:${GITHUB_SHA}" \
+            origin "${NEXT_SHA}:refs/heads/main"
+
+          echo "$RESULT"
+          echo "The next scheduled run will wait about 24 hours before continuing."
+          {
+            echo "### Contribution painter cleanup"
+            echo "$RESULT"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Prepare one repaint batch
+        if: steps.operation.outputs.mode == 'repaint'
+        id: batch
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "component=" >> "$GITHUB_OUTPUT"
+
+          mapfile -t ROOTS < <(git rev-list --max-parents=0 HEAD)
+          if (( ${#ROOTS[@]} != 1 )); then
+            echo "::error::Expected exactly one root commit; found ${#ROOTS[@]}."
+            exit 1
+          fi
+          ROOT="${ROOTS[0]}"
+          ROOT_SUBJECT="$(git show -s --format=%s "$ROOT")"
+          ROOT_EMAIL="$(git show -s --format=%ae "$ROOT")"
+          if [[ "$ROOT_SUBJECT" != 'chore: reset contribution graph painter' ]] || \
+             [[ "$ROOT_EMAIL" != '41898282+github-actions[bot]@users.noreply.github.com' ]]; then
+            echo "::error::The fixed cleanup root is missing. Run this workflow once in cleanup mode."
+            exit 1
+          fi
+
+          NOW="$(date -u +%s)"
+          ROOT_AGE="$(( NOW - $(git show -s --format=%ct "$ROOT") ))"
+          if (( ROOT_AGE < MIN_ROOT_AGE_SECONDS )); then
+            echo "The cleanup root is only ${ROOT_AGE}s old; repainting will start on a later daily run."
+            exit 0
+          fi
+
+          LAST_BATCH="$(git log --first-parent --format=%H \
+            --grep='^repaint batch:' -1 HEAD)"
+          if [[ -n "$LAST_BATCH" ]]; then
+            BATCH_AGE="$(( NOW - $(git show -s --format=%ct "$LAST_BATCH") ))"
+            if (( BATCH_AGE < MIN_BATCH_AGE_SECONDS )); then
+              echo "The previous repaint batch is only ${BATCH_AGE}s old; the next daily run will continue."
+              exit 0
+            fi
+          fi
+
+          ROOT_TREE="$(git rev-parse "${ROOT}^{tree}")"
+          CURRENT_TREE="$(git rev-parse 'HEAD^{tree}')"
+
+          TOTAL="$(git rev-list --count HEAD)"
+          if (( TOTAL > MAX_PAINTED_HISTORY_COMMITS )); then
+            echo "::error::Painted history has ${TOTAL} commits, above the ${MAX_PAINTED_HISTORY_COMMITS}-commit guard."
+            exit 1
+          fi
+
+          CYCLE_END="$(date -u +'%Y-%m-01')"
+          mapfile -t ALL_COMPONENTS < <(python3 art/paint.py --list-components --order left)
+          for COMPONENT in "${ALL_COMPONENTS[@]}"; do
+            REF="refs/remotes/origin/paint/${COMPONENT}"
+            if ! git show-ref --verify --quiet "$REF"; then
+              continue
+            fi
+            TIP="$(git rev-parse "$REF")"
+            if ! git merge-base --is-ancestor "$ROOT" "$TIP"; then
+              echo "::error::${REF} is not based on the fixed cleanup root."
+              exit 1
+            fi
+            if [[ "$(git rev-parse "${TIP}^{tree}")" != "$ROOT_TREE" ]]; then
+              echo "::error::${REF} does not restore the fixed repository tree."
+              exit 1
+            fi
+          done
+
+          mapfile -t COMPONENTS < <(python3 art/paint.py --list-components --order repaint)
+          SELECTED=''
+          OLD_TIP=''
+          for COMPONENT in "${COMPONENTS[@]}"; do
+            REF="refs/remotes/origin/paint/${COMPONENT}"
+            if git show-ref --verify --quiet "$REF"; then
+              TIP="$(git rev-parse "$REF")"
+              TIP_SUBJECT="$(git show -s --format=%s "$TIP")"
+              EXPECTED="$(python3 art/paint.py --marker \
+                --component "$COMPONENT" --end-date "$CYCLE_END" \
+                --commits-per-pixel "$COMMITS_PER_PIXEL")"
+              if [[ "$TIP_SUBJECT" != "$EXPECTED" ]]; then
+                SELECTED="$COMPONENT"
+                OLD_TIP="$TIP"
+                break
+              fi
+            else
+              SELECTED="$COMPONENT"
+              break
+            fi
+          done
+
+          if [[ -z "$SELECTED" ]]; then
+            echo "All components already target ${CYCLE_END}; nothing to do until next month."
+            exit 0
+          fi
+
+          echo "root=${ROOT}" >> "$GITHUB_OUTPUT"
+          echo "root_tree=${ROOT_TREE}" >> "$GITHUB_OUTPUT"
+          echo "current_tree=${CURRENT_TREE}" >> "$GITHUB_OUTPUT"
+          echo "cycle_end=${CYCLE_END}" >> "$GITHUB_OUTPUT"
+          echo "component=${SELECTED}" >> "$GITHUB_OUTPUT"
+          echo "old_tip=${OLD_TIP}" >> "$GITHUB_OUTPUT"
+          echo "Selected ${SELECTED} for the ${CYCLE_END} cycle."
+
+      - name: Build and publish one repaint batch
+        if: steps.operation.outputs.mode == 'repaint' && steps.batch.outputs.component != ''
+        shell: bash
+        env:
+          ROOT: ${{ steps.batch.outputs.root }}
+          ROOT_TREE: ${{ steps.batch.outputs.root_tree }}
+          CURRENT_TREE: ${{ steps.batch.outputs.current_tree }}
+          CYCLE_END: ${{ steps.batch.outputs.cycle_end }}
+          COMPONENT: ${{ steps.batch.outputs.component }}
+          OLD_TIP: ${{ steps.batch.outputs.old_tip }}
+        run: |
+          set -euo pipefail
+          git update-ref -d refs/heads/paint-rebuild || true
+
+          python3 art/paint.py --stream \
+            --component "$COMPONENT" --end-date "$CYCLE_END" \
+            --root "$ROOT" --head-tree "$ROOT_TREE" \
+            --branch paint-rebuild \
+            --name "James Feore" --email "jjfeore@gmail.com" \
+            --commits-per-pixel "$COMMITS_PER_PIXEL" \
+            --max-commits "$MAX_COMPONENT_COMMITS" \
+            | git fast-import --force --quiet
+
+          NEW_TIP="$(git rev-parse paint-rebuild)"
+          GENERATED="$(git rev-list --count "${ROOT}..${NEW_TIP}")"
+          if (( GENERATED > MAX_COMPONENT_COMMITS )); then
+            echo "::error::Generated ${GENERATED} commits; refusing oversized component."
+            exit 1
+          fi
+          if [[ "$(git rev-parse "${NEW_TIP}^{tree}")" != "$ROOT_TREE" ]]; then
+            echo "::error::Component branch did not restore the fixed repository tree."
+            exit 1
+          fi
+          EXPECTED="$(python3 art/paint.py --marker \
+            --component "$COMPONENT" --end-date "$CYCLE_END" \
+            --commits-per-pixel "$COMMITS_PER_PIXEL")"
+          if [[ "$(git show -s --format=%s "$NEW_TIP")" != "$EXPECTED" ]]; then
+            echo "::error::Component branch has an unexpected state marker."
+            exit 1
+          fi
+
+          mapfile -t COMPONENTS < <(python3 art/paint.py --list-components --order left)
+          PARENT_ARGS=()
+          for SLUG in "${COMPONENTS[@]}"; do
+            if [[ "$SLUG" == "$COMPONENT" ]]; then
+              TIP="$NEW_TIP"
+            elif git show-ref --verify --quiet "refs/remotes/origin/paint/${SLUG}"; then
+              TIP="$(git rev-parse "refs/remotes/origin/paint/${SLUG}")"
+            else
+              continue
+            fi
+            PARENT_ARGS+=( -p "$TIP" )
+          done
+
+          export GIT_AUTHOR_NAME='github-actions[bot]'
+          export GIT_AUTHOR_EMAIL='41898282+github-actions[bot]@users.noreply.github.com'
+          export GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME"
+          export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
+          STAMP="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          export GIT_AUTHOR_DATE="$STAMP"
+          export GIT_COMMITTER_DATE="$STAMP"
+          MESSAGE="repaint batch: ${COMPONENT} ${CYCLE_END}"
+          MAIN_SHA="$(printf '%s\n' "$MESSAGE" | git commit-tree "$CURRENT_TREE" "${PARENT_ARGS[@]}")"
+
+          read -r OLD_ONLY NEW_ONLY < <(
+            git rev-list --left-right --count "${GITHUB_SHA}...${MAIN_SHA}"
+          )
+          CHANGED="$(( OLD_ONLY + NEW_ONLY ))"
+          if (( CHANGED > MAX_CHANGED_COMMITS )); then
+            echo "::error::This rewrite changes ${CHANGED} commits, above the ${MAX_CHANGED_COMMITS}-commit guard."
+            exit 1
+          fi
+
+          TARGET_REF="refs/heads/paint/${COMPONENT}"
+          LEASES=( --force-with-lease="refs/heads/main:${GITHUB_SHA}" )
+          if [[ -n "$OLD_TIP" ]]; then
+            LEASES+=( --force-with-lease="${TARGET_REF}:${OLD_TIP}" )
+          else
+            LEASES+=( --force-with-lease="${TARGET_REF}:" )
+          fi
+          git push --atomic "${LEASES[@]}" origin \
+            "${NEW_TIP}:${TARGET_REF}" \
+            "${MAIN_SHA}:refs/heads/main"
+
+          echo "Published ${COMPONENT}: ${GENERATED} generated commits, ${CHANGED} commits changed by the rewrite."
+          {
+            echo "### Contribution painter batch"
+            echo "- Cycle: ${CYCLE_END}"
+            echo "- Component: ${COMPONENT}"
+            echo "- Generated commits: ${GENERATED}"
+            echo "- Changed commits: ${CHANGED} / ${MAX_CHANGED_COMMITS}"
+          } >> "$GITHUB_STEP_SUMMARY"
